@@ -21,7 +21,7 @@ from transformers import (
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="Qwen/Qwen3-0.6B")
-    p.add_argument("--tokenizer", default="google-bert/bert-base-multilingual-cased")
+    p.add_argument("--tokenizer", default="google-bert/bert-base-uncased")
     p.add_argument("--init", choices=["mean", "random"], default="mean",
                    help="mean: average the Qwen embeddings of each BERT token's Qwen sub-tokens")
     p.add_argument("--dataset", default="Salesforce/wikitext")
