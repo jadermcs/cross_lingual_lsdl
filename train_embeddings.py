@@ -1,13 +1,22 @@
-"""Swap Qwen3's tokenizer for a BERT (WordPiece) tokenizer and train only the tied embeddings.
+"""Swap Qwen3's tokenizer for a BERT (WordPiece) tokenizer, make it bidirectional, and train the
+tied embeddings plus (optionally) the attention layers.
 
-The transformer body stays frozen. A single new embedding matrix (|V_bert| x d) is used both as
-input embeddings and as the LM head (tied), and is the only trainable parameter.
+A single new embedding matrix (|V_bert| x d) is used both as input embeddings and as the LM head
+(tied). Since the attention was pretrained causally, `--trainable attention` (default) also trains
+the self-attention blocks (q/k/v/o projections and q/k norms) at a lower learning rate so they can
+adapt to seeing the full sequence; `--trainable all` trains the whole model.
+
+With bidirectional attention next-token prediction is trivial, so training uses masked tokens:
+  mntp: masked token i is predicted from the output at position i-1 (LLM2Vec). This keeps the
+        frozen body's pretrained "output predicts the next token" alignment.
+  mlm:  masked token i is predicted from the output at position i (BERT).
 """
 
 import argparse
 import itertools
 
 import torch
+from bidirectional import make_bidirectional
 from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
@@ -24,14 +33,18 @@ def parse_args():
     p.add_argument("--tokenizer", default="google-bert/bert-base-uncased")
     p.add_argument("--init", choices=["mean", "random"], default="mean",
                    help="mean: average the Qwen embeddings of each BERT token's Qwen sub-tokens")
+    p.add_argument("--objective", choices=["mntp", "mlm"], default="mntp")
+    p.add_argument("--mask_prob", type=float, default=0.15)
     p.add_argument("--dataset", default="Salesforce/wikitext")
     p.add_argument("--dataset_config", default="wikitext-103-raw-v1")
     p.add_argument("--split", default="train")
     p.add_argument("--text_column", default="text")
     p.add_argument("--streaming", action="store_true")
     p.add_argument("--seq_len", type=int, default=1024)
-    p.add_argument("--output_dir", default="checkpoints/qwen3-0.6b-bert-emb")
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--output_dir", default="checkpoints/qwen3-0.6b-bert-emb-bidir")
+    p.add_argument("--trainable", choices=["embeddings", "attention", "all"], default="attention")
+    p.add_argument("--lr", type=float, default=1e-3, help="learning rate for the new embeddings")
+    p.add_argument("--body_lr", type=float, default=5e-5, help="learning rate for pretrained transformer weights")
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--grad_accum", type=int, default=4)
     p.add_argument("--max_steps", type=int, default=10_000)
@@ -97,14 +110,20 @@ def swap_vocab(model, old_tok, new_tok, init):
         model.generation_config.eos_token_id = cfg.eos_token_id
 
 
-def freeze_all_but_embeddings(model):
-    for p in model.parameters():
-        p.requires_grad_(False)
-    model.get_input_embeddings().weight.requires_grad_(True)
-    assert model.get_output_embeddings().weight is model.get_input_embeddings().weight
+def set_trainable(model, trainable):
+    """Freeze everything except the requested parts; return the trainable body (non-embedding) params."""
+    emb = model.get_input_embeddings().weight
+    assert model.get_output_embeddings().weight is emb
+    body = []
+    for name, p in model.named_parameters():
+        train = p is emb or trainable == "all" or (trainable == "attention" and ".self_attn." in name)
+        p.requires_grad_(train)
+        if train and p is not emb:
+            body.append(p)
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
     print(f"Trainable params: {n_train:,} / {n_total:,} ({100 * n_train / n_total:.1f}%)")
+    return body
 
 
 def build_dataset(args, tok):
@@ -127,6 +146,23 @@ def build_dataset(args, tok):
     return ds
 
 
+class MaskedCollator(DataCollatorForLanguageModeling):
+    """BERT-style masking (80% [MASK] / 10% random / 10% kept), with labels laid out for the
+    causal-LM loss, which predicts labels[i + 1] from position i."""
+
+    def __init__(self, tokenizer, objective, mask_prob):
+        super().__init__(tokenizer, mlm=True, mlm_probability=mask_prob)
+        self.objective = objective
+
+    def torch_call(self, examples):
+        batch = super().torch_call(examples)
+        if self.objective == "mlm":
+            # Shift right so the loss's left shift lands each label back on its own position.
+            labels = batch["labels"]
+            batch["labels"] = torch.cat([torch.full_like(labels[:, :1], -100), labels[:, :-1]], dim=1)
+        return batch
+
+
 def resolve_precision(precision):
     if precision != "auto":
         return precision
@@ -145,7 +181,13 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32)
     swap_vocab(model, old_tok, new_tok, args.init)
-    freeze_all_but_embeddings(model)
+    make_bidirectional(model)
+    model.config.training_objective = args.objective  # tells inference which position predicts a mask
+    body_params = set_trainable(model, args.trainable)
+    param_groups = [{"params": [model.get_input_embeddings().weight], "lr": args.lr}]
+    if body_params:
+        param_groups.append({"params": body_params, "lr": args.body_lr})
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=0.0)
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.config.use_cache = False
@@ -175,8 +217,9 @@ def main():
         model=model,
         args=training_args,
         train_dataset=train_ds,
-        data_collator=DataCollatorForLanguageModeling(new_tok, mlm=False),
+        data_collator=MaskedCollator(new_tok, args.objective, args.mask_prob),
         processing_class=new_tok,
+        optimizers=(optimizer, None),  # scheduler is built by Trainer and scales both groups
     )
     trainer.train()
     trainer.save_model(args.output_dir)
