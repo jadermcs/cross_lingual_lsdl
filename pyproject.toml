@@ -1,0 +1,10 @@
+[project]
+name = "cross-lingual-lsdl"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.15.0",
+    "datasets>=5.0.1",
+    "torch>=2.14.1",
+    "transformers>=5.18.0",
+]
