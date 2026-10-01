@@ -43,6 +43,10 @@ def parse_args():
     p.add_argument("--dataset", default="Salesforce/wikitext")
     p.add_argument("--dataset_config", default="wikitext-103-raw-v1")
     p.add_argument("--split", default="train")
+    p.add_argument("--eval_split", default="validation", help="empty string disables evaluation")
+    p.add_argument("--eval_samples", type=int, default=256, help="held-out sequences (fixed masks in stage 2)")
+    p.add_argument("--eval_steps", type=int, default=500)
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--text_column", default="text")
     p.add_argument("--streaming", action="store_true")
     p.add_argument("--seq_len", type=int, default=1024)
@@ -142,8 +146,8 @@ def set_trainable(model, trainable):
     return body
 
 
-def build_dataset(args, tok):
-    ds = load_dataset(args.dataset, args.dataset_config, split=args.split, streaming=args.streaming)
+def build_dataset(args, tok, split):
+    ds = load_dataset(args.dataset, args.dataset_config, split=split, streaming=args.streaming)
     ds = ds.filter(lambda ex: bool(ex[args.text_column] and ex[args.text_column].strip()))
     sep = tok.sep_token_id
 
@@ -162,6 +166,19 @@ def build_dataset(args, tok):
     return ds
 
 
+def build_eval_dataset(args, tok, collator):
+    ds = build_dataset(args, tok, args.eval_split)
+    ds = ds.take(args.eval_samples) if args.streaming else ds.select(range(min(args.eval_samples, len(ds))))
+    rows = list(ds)
+    if not isinstance(collator, MaskedCollator):
+        return rows
+    # Mask once with a fixed seed so every run (and every eval step) scores the same targets.
+    with torch.random.fork_rng():
+        torch.manual_seed(0)
+        batch = collator([dict(r) for r in rows])
+    return [{"input_ids": i.tolist(), "labels": l.tolist()} for i, l in zip(batch["input_ids"], batch["labels"])]
+
+
 class MaskedCollator(DataCollatorForLanguageModeling):
     """BERT-style masking (80% [MASK] / 10% random / 10% kept), with labels laid out for the
     causal-LM loss, which predicts labels[i + 1] from position i."""
@@ -171,6 +188,8 @@ class MaskedCollator(DataCollatorForLanguageModeling):
         self.objective = objective
 
     def torch_call(self, examples):
+        if "labels" in examples[0]:  # pre-masked eval set
+            return {k: torch.tensor([ex[k] for ex in examples]) for k in ("input_ids", "labels")}
         batch = super().torch_call(examples)
         if self.objective == "mlm":
             # Shift right so the loss's left shift lands each label back on its own position.
@@ -222,7 +241,8 @@ def main():
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.config.use_cache = False
 
-    train_ds = build_dataset(args, tok)
+    train_ds = build_dataset(args, tok, args.split)
+    eval_ds = build_eval_dataset(args, tok, collator) if args.eval_split else None
     precision = resolve_precision(args.precision)
     print(f"Precision: {precision} (master weights fp32)")
 
@@ -242,17 +262,24 @@ def main():
         fp16=precision == "fp16",
         dataloader_num_workers=2,
         report_to=args.report_to,
+        eval_strategy="steps" if eval_ds else "no",
+        eval_steps=args.eval_steps,
+        eval_on_start=bool(eval_ds),
+        per_device_eval_batch_size=args.batch_size,
+        seed=args.seed,
     )
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
+        eval_dataset=eval_ds,
         data_collator=collator,
         processing_class=tok,
         optimizers=(optimizer, None),  # scheduler is built by Trainer and scales both groups
     )
     trainer.train()
     trainer.save_model(args.output_dir)
+    trainer.save_state()  # trainer_state.json (loss/eval history) in output_dir
     tok.save_pretrained(args.output_dir)
 
 
